@@ -855,35 +855,39 @@ public class ShopInteractListener implements Listener {
                                 econ.depositPlayer(executor, worldName, newPrice);
                             }
                         } else {
-                            ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.BUY, newAmount, newPrice);
-                            Bukkit.getPluginManager().callEvent(event);
-
-                            if (event.isCancelled()) {
-                                econ.depositPlayer(executor, worldName, newPrice);
-                                plugin.debug("Buy event cancelled (#" + shop.getID() + ")");
-                                return;
-                            }
-
-                            database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.BUY, null);
-
+                            int finalNewAmount1 = newAmount;
                             Bukkit.getScheduler().runTask(plugin, ()-> {
-                                addToInventory(inventory, newProduct);
-                                executor.updateInventory();
-                            });
+                                ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.BUY, finalNewAmount1, newPrice);
+                                Bukkit.getPluginManager().callEvent(event);
 
-                            new BukkitRunnable() {
-                                @Override
-                                public void run() {
-                                    if (plugin.getHologramFormat().isDynamic()) {
-                                        shop.updateHologramText();
-                                    }
+                                if (event.isCancelled()) {
+                                    econ.depositPlayer(executor, worldName, newPrice);
+                                    plugin.debug("Buy event cancelled (#" + shop.getID() + ")");
+                                }else {
+                                    Bukkit.getScheduler().runTaskAsynchronously(plugin, ()-> {
+                                        database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.BUY, null);
+
+                                        Bukkit.getScheduler().runTask(plugin, () -> {
+                                            addToInventory(inventory, newProduct);
+                                            executor.updateInventory();
+                                        });
+
+                                        new BukkitRunnable() {
+                                            @Override
+                                            public void run() {
+                                                if (plugin.getHologramFormat().isDynamic()) {
+                                                    shop.updateHologramText();
+                                                }
+                                            }
+                                        }.runTaskLater(plugin, 1L);
+
+                                        executor.sendMessage(LanguageUtils.getMessage(Message.BUY_SUCCESS_ADMIN, new Replacement(Placeholder.AMOUNT, String.valueOf(finalNewAmount1)),
+                                                new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.BUY_PRICE, String.valueOf(newPrice))));
+
+                                        plugin.debug(executor.getName() + " successfully bought (#" + shop.getID() + ")");
+                                    });
                                 }
-                            }.runTaskLater(plugin, 1L);
-
-                            executor.sendMessage(LanguageUtils.getMessage(Message.BUY_SUCCESS_ADMIN, new Replacement(Placeholder.AMOUNT, String.valueOf(newAmount)),
-                                    new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.BUY_PRICE, String.valueOf(newPrice))));
-
-                            plugin.debug(executor.getName() + " successfully bought (#" + shop.getID() + ")");
+                            } );
                         }
                     } else {
                         plugin.debug("Economy transaction failed (r): " + r.errorMessage + " (#" + shop.getID() + ")");
@@ -909,167 +913,178 @@ public class ShopInteractListener implements Listener {
         plugin.debug(executor.getName() + " is selling (#" + shop.getID() + ")");
 
         ItemStack itemStack = shop.getProduct().getItemStack();
-        int amount = shop.getProduct().getAmount();
-        if (stack) amount = itemStack.getMaxStackSize();
 
-        double price = shop.getSellPrice();
-        if (stack) price = (price / shop.getProduct().getAmount()) * amount;
 
         String worldName = shop.getLocation().getWorld().getName();
+        Block block = shop.getLocation().getBlock();
+        Chest chest = (Chest) block.getState();
+        Inventory inventory = chest.getInventory();
+        Inventory playerInventory = executor.getInventory();
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, ()-> {
+            int amount = shop.getProduct().getAmount();
+            if (stack) amount = itemStack.getMaxStackSize();
+            double price = shop.getSellPrice();
+            if (stack) price = (price / shop.getProduct().getAmount()) * amount;
+            if (shop.getShopType() == ShopType.ADMIN || econ.getBalance(shop.getVendor(), worldName) >= price || Config.autoCalculateItemAmount) {
+                int amountForMoney = 1;
 
-        if (shop.getShopType() == ShopType.ADMIN || econ.getBalance(shop.getVendor(), worldName) >= price || Config.autoCalculateItemAmount) {
-            int amountForMoney = 1;
-            
-            if (shop.getShopType() != ShopType.ADMIN) {
-                 amountForMoney = (int) (amount / price * econ.getBalance(shop.getVendor(), worldName));
-            }
+                if (shop.getShopType() != ShopType.ADMIN) {
+                    amountForMoney = (int) (amount / price * econ.getBalance(shop.getVendor(), worldName));
+                }
 
-            plugin.debug("Vendor has enough money for " + amountForMoney + " item(s) (#" + shop.getID() + ")");
+                plugin.debug("Vendor has enough money for " + amountForMoney + " item(s) (#" + shop.getID() + ")");
 
-            if (amountForMoney == 0 && Config.autoCalculateItemAmount && shop.getShopType() != ShopType.ADMIN) {
-                executor.sendMessage(LanguageUtils.getMessage(Message.VENDOR_NOT_ENOUGH_MONEY));
-                return;
-            }
+                if (amountForMoney == 0 && Config.autoCalculateItemAmount && shop.getShopType() != ShopType.ADMIN) {
+                    executor.sendMessage(LanguageUtils.getMessage(Message.VENDOR_NOT_ENOUGH_MONEY));
+                    return;
+                }
 
-            Block block = shop.getLocation().getBlock();
-            Chest chest = (Chest) block.getState();
+                int amountForItemCount = Utils.getAmount(playerInventory, itemStack);
 
-            int amountForItemCount = Utils.getAmount(executor.getInventory(), itemStack);
+                if (amountForItemCount == 0) {
+                    executor.sendMessage(LanguageUtils.getMessage(Message.NOT_ENOUGH_ITEMS));
+                    return;
+                }
 
-            if (amountForItemCount == 0) {
-                executor.sendMessage(LanguageUtils.getMessage(Message.NOT_ENOUGH_ITEMS));
-                return;
-            }
+                ItemStack product = new ItemStack(itemStack);
+                if (stack) product.setAmount(amount);
 
-            ItemStack product = new ItemStack(itemStack);
-            if (stack) product.setAmount(amount);
+                int freeSpace = Utils.getFreeSpaceForItem(inventory, product);
 
-            Inventory inventory = chest.getInventory();
+                if (freeSpace == 0 && shop.getShopType() != ShopType.ADMIN) {
+                    executor.sendMessage(LanguageUtils.getMessage(Message.CHEST_NOT_ENOUGH_INVENTORY_SPACE));
+                    return;
+                }
 
-            int freeSpace = Utils.getFreeSpaceForItem(inventory, product);
+                int newAmount = amount;
 
-            if (freeSpace == 0 && shop.getShopType() != ShopType.ADMIN) {
-                executor.sendMessage(LanguageUtils.getMessage(Message.CHEST_NOT_ENOUGH_INVENTORY_SPACE));
-                return;
-            }
+                if (Config.autoCalculateItemAmount) {
+                    if (shop.getShopType() == ShopType.ADMIN)
+                        newAmount = amountForItemCount;
+                    else
+                        newAmount = Math.min(Math.min(amountForMoney, amountForItemCount), freeSpace);
+                }
 
-            int newAmount = amount;
+                if (newAmount > amount) newAmount = amount;
 
-            if (Config.autoCalculateItemAmount) {
-                if (shop.getShopType() == ShopType.ADMIN)
-                    newAmount = amountForItemCount;
-                else
-                    newAmount = Math.min(Math.min(amountForMoney, amountForItemCount), freeSpace);
-            }
+                ShopProduct newProduct = new ShopProduct(product, newAmount);
+                double newPrice = (price / amount) * newAmount;
 
-            if (newAmount > amount) newAmount = amount;
+                if (freeSpace >= newAmount || shop.getShopType() == ShopType.ADMIN) {
+                    plugin.debug("Chest has enough inventory space for " + freeSpace + " items (#" + shop.getID() + ")");
 
-            ShopProduct newProduct = new ShopProduct(product, newAmount);
-            double newPrice = (price / amount) * newAmount;
+                    EconomyResponse r = econ.depositPlayer(executor, worldName, newPrice);
 
-            if (freeSpace >= newAmount || shop.getShopType() == ShopType.ADMIN) {
-                plugin.debug("Chest has enough inventory space for " + freeSpace + " items (#" + shop.getID() + ")");
+                    if (r.transactionSuccess()) {
+                        EconomyResponse r2 = (shop.getShopType() != ShopType.ADMIN) ? econ.withdrawPlayer(shop.getVendor(), worldName, newPrice) : null;
 
-                EconomyResponse r = econ.depositPlayer(executor, worldName, newPrice);
+                        if (r2 != null) {
+                            if (r2.transactionSuccess()) {
+                                int finalNewAmount = newAmount;
+                                Bukkit.getScheduler().runTask(plugin, ()-> {
 
-                if (r.transactionSuccess()) {
-                    EconomyResponse r2 = (shop.getShopType() != ShopType.ADMIN) ? econ.withdrawPlayer(shop.getVendor(), worldName, newPrice) : null;
+                                    ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.SELL, finalNewAmount, newPrice);
+                                    Bukkit.getPluginManager().callEvent(event);
 
-                    if (r2 != null) {
-                        if (r2.transactionSuccess()) {
-                            ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.SELL, newAmount, newPrice);
-                            Bukkit.getPluginManager().callEvent(event);
+                                    if (event.isCancelled()) {
+                                        econ.withdrawPlayer(executor, worldName, newPrice);
+                                        econ.depositPlayer(shop.getVendor(), worldName, newPrice);
+                                        plugin.debug("Sell event cancelled (#" + shop.getID() + ")");
+                                    }else {
+                                        Bukkit.getScheduler().runTaskAsynchronously(plugin, ()-> {
+                                            database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.SELL, null);
 
-                            if (event.isCancelled()) {
+                                            Bukkit.getScheduler().runTask(plugin, ()-> {
+                                                addToInventory(inventory, newProduct);
+                                                removeFromInventory(executor.getInventory(), newProduct);
+                                                executor.updateInventory();
+                                            });
+
+                                            new BukkitRunnable() {
+                                                @Override
+                                                public void run() {
+                                                    if (plugin.getHologramFormat().isDynamic()) {
+                                                        shop.updateHologramText();
+                                                    }
+                                                }
+                                            }.runTaskLater(plugin, 1L);
+
+                                            String vendorName = (shop.getVendor().getName() == null ? shop.getVendor().getUniqueId().toString() : shop.getVendor().getName());
+                                            executor.sendMessage(LanguageUtils.getMessage(Message.SELL_SUCCESS, new Replacement(Placeholder.AMOUNT, String.valueOf(finalNewAmount)),
+                                                    new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
+                                                    new Replacement(Placeholder.VENDOR, vendorName)));
+
+                                            plugin.debug(executor.getName() + " successfully sold (#" + shop.getID() + ")");
+
+                                            if (shop.getVendor().isOnline() && Config.enableVendorMessages) {
+                                                shop.getVendor().getPlayer().sendMessage(LanguageUtils.getMessage(Message.SOMEONE_SOLD, new Replacement(Placeholder.AMOUNT, String.valueOf(finalNewAmount)),
+                                                        new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
+                                                        new Replacement(Placeholder.PLAYER, executor.getName())));
+                                            } else if (!shop.getVendor().isOnline() && Config.enableVendorBungeeMessages) {
+                                                String message = LanguageUtils.getMessage(Message.SOMEONE_SOLD, new Replacement(Placeholder.AMOUNT, String.valueOf(finalNewAmount)),
+                                                        new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
+                                                        new Replacement(Placeholder.PLAYER, executor.getName()));
+                                                sendBungeeMessage(shop.getVendor().getName(), message);
+                                            }
+                                        });
+                                    }
+                                });
+                            } else {
+                                plugin.debug("Economy transaction failed (r2): " + r2.errorMessage + " (#" + shop.getID() + ")");
+                                executor.sendMessage(LanguageUtils.getMessage(Message.ERROR_OCCURRED, new Replacement(Placeholder.ERROR, r2.errorMessage)));
                                 econ.withdrawPlayer(executor, worldName, newPrice);
                                 econ.depositPlayer(shop.getVendor(), worldName, newPrice);
-                                plugin.debug("Sell event cancelled (#" + shop.getID() + ")");
-                                return;
-                            }
-
-                            database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.SELL, null);
-
-                            addToInventory(inventory, newProduct);
-                            removeFromInventory(executor.getInventory(), newProduct);
-                            executor.updateInventory();
-
-                            new BukkitRunnable() {
-                                @Override
-                                public void run() {
-                                    if (plugin.getHologramFormat().isDynamic()) {
-                                        shop.updateHologramText();
-                                    }
-                                }
-                            }.runTaskLater(plugin, 1L);
-
-                            String vendorName = (shop.getVendor().getName() == null ? shop.getVendor().getUniqueId().toString() : shop.getVendor().getName());
-                            executor.sendMessage(LanguageUtils.getMessage(Message.SELL_SUCCESS, new Replacement(Placeholder.AMOUNT, String.valueOf(newAmount)),
-                                    new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
-                                    new Replacement(Placeholder.VENDOR, vendorName)));
-
-                            plugin.debug(executor.getName() + " successfully sold (#" + shop.getID() + ")");
-
-                            if (shop.getVendor().isOnline() && Config.enableVendorMessages) {
-                                shop.getVendor().getPlayer().sendMessage(LanguageUtils.getMessage(Message.SOMEONE_SOLD, new Replacement(Placeholder.AMOUNT, String.valueOf(newAmount)),
-                                        new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
-                                        new Replacement(Placeholder.PLAYER, executor.getName())));
-                            } else if(!shop.getVendor().isOnline() && Config.enableVendorBungeeMessages){
-                                String message = LanguageUtils.getMessage( Message.SOMEONE_SOLD, new Replacement(Placeholder.AMOUNT, String.valueOf(newAmount)),
-                                        new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice)),
-                                        new Replacement(Placeholder.PLAYER, executor.getName()));
-                                sendBungeeMessage(shop.getVendor().getName(),message);
                             }
 
                         } else {
-                            plugin.debug("Economy transaction failed (r2): " + r2.errorMessage + " (#" + shop.getID() + ")");
-                            executor.sendMessage(LanguageUtils.getMessage(Message.ERROR_OCCURRED, new Replacement(Placeholder.ERROR, r2.errorMessage)));
-                            econ.withdrawPlayer(executor, worldName, newPrice);
-                            econ.depositPlayer(shop.getVendor(), worldName, newPrice);
+                            int finalNewAmount1 = newAmount;
+                            Bukkit.getScheduler().runTask(plugin, ()-> {
+                                ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.SELL, finalNewAmount1, newPrice);
+                                Bukkit.getPluginManager().callEvent(event);
+
+                                if (event.isCancelled()) {
+                                    econ.withdrawPlayer(executor, worldName, newPrice);
+                                    plugin.debug("Sell event cancelled (#" + shop.getID() + ")");
+                                    return;
+                                }else {
+
+                                    removeFromInventory(executor.getInventory(), newProduct);
+                                    executor.updateInventory();
+                                    Bukkit.getScheduler().runTaskAsynchronously(plugin, ()-> {
+                                        database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.SELL, null);
+
+                                        new BukkitRunnable() {
+                                            @Override
+                                            public void run() {
+                                                if (plugin.getHologramFormat().isDynamic()) {
+                                                    shop.updateHologramText();
+                                                }
+                                            }
+                                        }.runTaskLater(plugin, 1L);
+
+                                        executor.sendMessage(LanguageUtils.getMessage(Message.SELL_SUCCESS_ADMIN, new Replacement(Placeholder.AMOUNT, String.valueOf(finalNewAmount1)),
+                                                new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice))));
+
+                                        plugin.debug(executor.getName() + " successfully sold (#" + shop.getID() + ")");
+                                    });
+                                }
+                            });
                         }
 
                     } else {
-                        ShopBuySellEvent event = new ShopBuySellEvent(executor, shop, ShopBuySellEvent.Type.SELL, newAmount, newPrice);
-                        Bukkit.getPluginManager().callEvent(event);
-
-                        if (event.isCancelled()) {
-                            econ.withdrawPlayer(executor, worldName, newPrice);
-                            plugin.debug("Sell event cancelled (#" + shop.getID() + ")");
-                            return;
-                        }
-
-                        database.logEconomy(executor, shop, newProduct, newPrice, ShopBuySellEvent.Type.SELL, null);
-
-                        removeFromInventory(executor.getInventory(), newProduct);
-                        executor.updateInventory();
-
-                        new BukkitRunnable() {
-                            @Override
-                            public void run() {
-                                if (plugin.getHologramFormat().isDynamic()) {
-                                    shop.updateHologramText();
-                                }
-                            }
-                        }.runTaskLater(plugin, 1L);
-
-                        executor.sendMessage(LanguageUtils.getMessage(Message.SELL_SUCCESS_ADMIN, new Replacement(Placeholder.AMOUNT, String.valueOf(newAmount)),
-                                new Replacement(Placeholder.ITEM_NAME, newProduct.getLocalizedName()), new Replacement(Placeholder.SELL_PRICE, String.valueOf(newPrice))));
-
-                        plugin.debug(executor.getName() + " successfully sold (#" + shop.getID() + ")");
+                        plugin.debug("Economy transaction failed (r): " + r.errorMessage + " (#" + shop.getID() + ")");
+                        executor.sendMessage(LanguageUtils.getMessage(Message.ERROR_OCCURRED, new Replacement(Placeholder.ERROR, r.errorMessage)));
+                        econ.withdrawPlayer(executor, worldName, newPrice);
                     }
 
                 } else {
-                    plugin.debug("Economy transaction failed (r): " + r.errorMessage + " (#" + shop.getID() + ")");
-                    executor.sendMessage(LanguageUtils.getMessage(Message.ERROR_OCCURRED, new Replacement(Placeholder.ERROR, r.errorMessage)));
-                    econ.withdrawPlayer(executor, worldName, newPrice);
+                    executor.sendMessage(LanguageUtils.getMessage(Message.CHEST_NOT_ENOUGH_INVENTORY_SPACE));
                 }
 
             } else {
-                executor.sendMessage(LanguageUtils.getMessage(Message.CHEST_NOT_ENOUGH_INVENTORY_SPACE));
+                executor.sendMessage(LanguageUtils.getMessage(Message.VENDOR_NOT_ENOUGH_MONEY));
             }
-
-        } else {
-            executor.sendMessage(LanguageUtils.getMessage(Message.VENDOR_NOT_ENOUGH_MONEY));
-        }
+        });
     }
 
 
